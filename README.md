@@ -22,10 +22,38 @@
 
 ---
 
+## 🎬 效果展示（截图 / GIF）
+
+> 💡 **求职面试加分关键**：跑通部署后把截图替换到 `screenshots/` 目录（文件名参考 [screenshots/README.md](screenshots/README.md)），README 会自动显示。一张 `verify.sh` 10 项全通过的图，胜过千言万语。
+
+### 1. 一键验收 · 10 项核心测试全通过
+![verify.sh 10 项全通过](screenshots/01-verify-all-pass.png)
+*`./verify.sh` 执行结果：Pod 就绪、反亲和分散、Headless Service、PVC 绑定、双探针、Cluster 状态、DNS 解析、数据持久化、Partition 灰度，**10/10 PASS** 证明整个方案端到端正确。*
+
+### 2. 集群运行态 · Pod 分散 / PVC 绑定 / Cluster 健康
+![集群运行状态](screenshots/02-pods-pvc-cluster.png)
+*左：`kubectl get pods -o wide` 显示 3 个 Pod 调度到 **3 个不同节点**（反亲和生效，无单点故障）；中：3 个 PVC 全部 Bound（StatefulSet volumeClaimTemplates 独立存储）；右：`cluster_state:ok`、`known_nodes:3`、`cluster_slots_assigned:16384`（Redis Cluster 全槽位分配正常）。*
+
+### 3. 一键部署进度
+![一键部署进度](screenshots/03-deploy-progress.png)
+*`./deploy.sh` 6 步自动化：节点标签 → 清理旧资源 → 部署 ConfigMap/Service → 部署 StatefulSet → 等待 Pod Ready → 等待 Cluster 初始化。*
+
+### 4. 数据持久化验证（Pod 删除重建数据不丢失）
+![数据持久化验证](screenshots/04-persistence-test.png)
+*`set foo bar` → 删除 `redis-0` Pod → StatefulSet 自动重建（PVC 保留）→ 重建后 `get foo` 仍返回 `bar`，证明 **AOF + PVC 持久化生效**，Pod 故障不会丢数据。*
+
+### 5. Partition 灰度发布（只有序号 ≥ partition 的 Pod 更新）
+![Partition 灰度发布](screenshots/05-partition-canary.png)
+*设置 `partition=2` 后，仅 `redis-2` 的 `controller-revision-hash` 更新为新版本，`redis-0/1` 保持旧版本，验证 **StatefulSet 滚动发布灰度能力**（先更一个 Pod，验证没问题再逐步调小 partition 全量发布）。*
+
+---
+
 ## 📁 项目结构
 
 ```
 .
+├── screenshots/              # 部署结果截图（跑通后放这里，README 自动引用）
+│   └── README.md             # 截图文件名 + 内容对照表
 ├── 00-configmap.yaml         # Redis 配置模板（ConfigMap）
 ├── 01-headless-service.yaml  # Headless Service + NodePort
 ├── 02-statefulset.yaml       # 3 节点 Redis StatefulSet（核心）
