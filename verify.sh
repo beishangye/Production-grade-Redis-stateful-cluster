@@ -18,6 +18,8 @@ GREEN='\033[32m'; RED='\033[31m'; YELLOW='\033[33m'; BLUE='\033[34m'; NC='\033[0
 pass(){ echo -e "${GREEN}✅ PASS: $1${NC}"; PASS=$((PASS+1)); }
 fail(){ echo -e "${RED}❌ FAIL: $1${NC}"; FAIL=$((FAIL+1)); }
 warn(){ echo -e "${YELLOW}⚠️  WARN: $1${NC}"; WARN=$((WARN+1)); }
+info(){ echo -e "${BLUE}ℹ️  $1${NC}"; }
+yellow(){ echo -e "${YELLOW}$1${NC}"; }
 title(){ echo; echo '============================================================'; echo "$1"; echo '============================================================'; }
 
 trap 'kubectl delete pod redis-dns-test-$BASHPID --ignore-not-found=true >/dev/null 2>&1 || true' EXIT
@@ -87,18 +89,30 @@ echo "$LP" | grep -q redis-cli && pass 'Liveness Probe 已配置' || fail '没�
 # 7 cluster
 
 title '[7/10] Redis Cluster 状态'
-CI=$(kubectl exec "$POD0" -- redis-cli cluster info 2>/dev/null || true)
-echo "$CI"
-STATE=$(echo "$CI" | awk -F: '/^cluster_state:/ {print $2}' | tr -d '\r' | xargs)
-NODES=$(echo "$CI" | awk -F: '/^cluster_known_nodes:/ {print $2}' | tr -d '\r' | xargs)
-SLOTS=$(echo "$CI" | awk -F: '/^cluster_slots_assigned:/ {print $2}' | tr -d '\r' | xargs)
-SIZE=$(echo "$CI" | awk -F: '/^cluster_size:/ {print $2}' | tr -d '\r' | xargs)
-if [ "$STATE" = ok ] && [ "$NODES" = 3 ] && [ "$SLOTS" = 16384 ] && [ "$SIZE" = 3 ]; then
-  pass 'Redis Cluster 正常：3 节点、16384 slots、cluster_state=ok'
+POD0_READY=$(kubectl get pod "$POD0" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+POD0_STATUS=$(kubectl get pod "$POD0" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+POD0_RESTARTS=$(kubectl get pod "$POD0" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || true)
+echo "    $POD0 STATUS=$POD0_STATUS READY=$POD0_READY RESTARTS=$POD0_RESTARTS"
+
+if [ "$POD0_READY" != true ]; then
+  echo "    诊断：redis-0 容器未 Ready（可能仍在初始化集群或 CrashLoopBackOff）"
+  echo "    建议：kubectl describe pod $POD0"
+  echo "    建议：kubectl logs $POD0 --previous"
+  fail "redis-0 未 Ready，无法执行 Redis Cluster 健康检查（STATUS=$POD0_STATUS RESTARTS=$POD0_RESTARTS）"
 else
-  fail 'Redis Cluster 状态异常'
+  CI=$(kubectl exec "$POD0" -- redis-cli cluster info 2>/dev/null || true)
+  echo "$CI"
+  STATE=$(echo "$CI" | awk -F: '/^cluster_state:/ {print $2}' | tr -d '\r' | xargs)
+  NODES=$(echo "$CI" | awk -F: '/^cluster_known_nodes:/ {print $2}' | tr -d '\r' | xargs)
+  SLOTS=$(echo "$CI" | awk -F: '/^cluster_slots_assigned:/ {print $2}' | tr -d '\r' | xargs)
+  SIZE=$(echo "$CI" | awk -F: '/^cluster_size:/ {print $2}' | tr -d '\r' | xargs)
+  if [ "$STATE" = ok ] && [ "$NODES" = 3 ] && [ "$SLOTS" = 16384 ] && [ "$SIZE" = 3 ]; then
+    pass 'Redis Cluster 正常：3 节点、16384 slots、cluster_state=ok'
+  else
+    fail "Redis Cluster 状态异常（state=$STATE nodes=$NODES slots=$SLOTS size=$SIZE）"
+  fi
+  echo; echo 'Cluster Nodes:'; kubectl exec "$POD0" -- redis-cli cluster nodes 2>/dev/null || true
 fi
-echo; echo 'Cluster Nodes:'; kubectl exec "$POD0" -- redis-cli cluster nodes 2>/dev/null || true
 
 # 8 DNS
 
@@ -192,54 +206,78 @@ kubectl delete pod "$DNSPOD" \
 # 9 persistence
 
 title '[9/10] 数据持久化'
-SET=$(kubectl exec "$POD0" -- redis-cli -c set "$TEST_KEY" "$TEST_VALUE" 2>/dev/null || true)
-echo "    写入结果: $SET"
-if [ "$SET" != OK ]; then
-  fail 'Redis 写入测试失败'
+POD0_READY_P9=$(kubectl get pod "$POD0" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+if [ "$POD0_READY_P9" != true ]; then
+  POD0_RESTARTS_P9=$(kubectl get pod "$POD0" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || true)
+  echo "    $POD0 容器未 Ready（RESTARTS=$POD0_RESTARTS_P9），跳过数据持久化测试。"
+  echo "    建议：先修复 redis-0 CrashLoop，再重新运行 verify.sh"
+  fail "redis-0 未 Ready，跳过数据持久化测试"
 else
-  BEFORE=$(kubectl exec "$POD0" -- redis-cli -c get "$TEST_KEY" 2>/dev/null || true)
-  echo "    删除 Pod 前读取: $BEFORE"
-  kubectl delete pod "$POD0" --wait=false >/dev/null 2>&1 || true
-  if kubectl wait --for=condition=Ready "pod/$POD0" --timeout=180s >/dev/null 2>&1; then
-    sleep 5
-    AFTER=$(kubectl exec "$POD0" -- redis-cli -c get "$TEST_KEY" 2>/dev/null || true)
-    echo "    Pod 重建后读取: $AFTER"
-    [ "$AFTER" = "$TEST_VALUE" ] && pass 'Redis 数据持久化成功' || fail 'Pod 重建后数据丢失'
+  SET=$(kubectl exec "$POD0" -- redis-cli -c set "$TEST_KEY" "$TEST_VALUE" 2>/dev/null || true)
+  echo "    写入结果: $SET"
+  if [ "$SET" != OK ]; then
+    fail 'Redis 写入测试失败'
   else
-    fail 'redis-0 删除后没有恢复 Ready'
+    BEFORE=$(kubectl exec "$POD0" -- redis-cli -c get "$TEST_KEY" 2>/dev/null || true)
+    echo "    删除 Pod 前读取: $BEFORE"
+    kubectl delete pod "$POD0" --wait=false >/dev/null 2>&1 || true
+    if kubectl wait --for=condition=Ready "pod/$POD0" --timeout=180s >/dev/null 2>&1; then
+      sleep 8
+      AFTER=$(kubectl exec "$POD0" -- redis-cli -c get "$TEST_KEY" 2>/dev/null || true)
+      echo "    Pod 重建后读取: $AFTER"
+      [ "$AFTER" = "$TEST_VALUE" ] && pass 'Redis 数据持久化成功' || fail 'Pod 重建后数据丢失'
+    else
+      fail 'redis-0 删除后没有恢复 Ready'
+    fi
   fi
 fi
 
 # 10 partition
 
 title '[10/10] Partition 灰度发布'
-OLD_UPDATE=$(kubectl get sts "$STS_NAME" -o jsonpath='{.status.updateRevision}' 2>/dev/null || true)
-OLD0=$(kubectl get pod "$POD0" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
-OLD1=$(kubectl get pod "$POD1" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
-TOKEN="partition-test-$(date +%s)"
-kubectl patch sts "$STS_NAME" --type=merge -p "{\"spec\":{\"updateStrategy\":{\"type\":\"RollingUpdate\",\"rollingUpdate\":{\"partition\":2}},\"template\":{\"metadata\":{\"annotations\":{\"qos-test-partition\":\"$TOKEN\"}}}}}" >/dev/null 2>&1
-NEW_UPDATE=""
-for _ in $(seq 1 60); do
-  NEW_UPDATE=$(kubectl get sts "$STS_NAME" -o jsonpath='{.status.updateRevision}' 2>/dev/null || true)
-  [ -n "$NEW_UPDATE" ] && [ "$NEW_UPDATE" != "$OLD_UPDATE" ] && break
-  sleep 1
+# Test precondition: redis-2 needs to be updatable. If no pods are Ready
+# at all, give a clear message instead of timing out silently.
+ANY_READY=false
+for p in "$POD0" "$POD1" "$POD2"; do
+  r=$(kubectl get pod "$p" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+  if [ "$r" = true ]; then ANY_READY=true; break; fi
 done
-for _ in $(seq 1 120); do
-  P2R=$(kubectl get pod "$POD2" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
-  P2READY=$(kubectl get pod "$POD2" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
-  [ "$P2R" = "$NEW_UPDATE" ] && [ "$P2READY" = true ] && break
-  sleep 1
-done
-CUR0=$(kubectl get pod "$POD0" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
-CUR1=$(kubectl get pod "$POD1" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
-CUR2=$(kubectl get pod "$POD2" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
-echo "    redis-0 revision = $CUR0"
-echo "    redis-1 revision = $CUR1"
-echo "    redis-2 revision = $CUR2"
-if [ "$CUR0" = "$OLD0" ] && [ "$CUR1" = "$OLD1" ] && [ "$CUR2" = "$NEW_UPDATE" ]; then
-  pass 'Partition=2 生效：只有 redis-2 更新'
+if [ "$ANY_READY" != true ]; then
+  echo "    当前没有 Redis Pod Ready，Partition 灰度无法验证。"
+  fail "没有 Ready Pod，跳过 Partition 灰度验证"
 else
-  fail 'Partition 灰度验证失败'
+  OLD_UPDATE=$(kubectl get sts "$STS_NAME" -o jsonpath='{.status.updateRevision}' 2>/dev/null || true)
+  OLD0=$(kubectl get pod "$POD0" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+  OLD1=$(kubectl get pod "$POD1" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+  TOKEN="partition-test-$(date +%s)"
+  kubectl patch sts "$STS_NAME" --type=merge -p "{\"spec\":{\"updateStrategy\":{\"type\":\"RollingUpdate\",\"rollingUpdate\":{\"partition\":2}},\"template\":{\"metadata\":{\"annotations\":{\"qos-test-partition\":\"$TOKEN\"}}}}}" >/dev/null 2>&1
+  NEW_UPDATE=""
+  for _ in $(seq 1 60); do
+    NEW_UPDATE=$(kubectl get sts "$STS_NAME" -o jsonpath='{.status.updateRevision}' 2>/dev/null || true)
+    [ -n "$NEW_UPDATE" ] && [ "$NEW_UPDATE" != "$OLD_UPDATE" ] && break
+    sleep 1
+  done
+  for _ in $(seq 1 120); do
+    P2R=$(kubectl get pod "$POD2" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+    P2READY=$(kubectl get pod "$POD2" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+    [ "$P2R" = "$NEW_UPDATE" ] && [ "$P2READY" = true ] && break
+    sleep 1
+  done
+  CUR0=$(kubectl get pod "$POD0" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+  CUR1=$(kubectl get pod "$POD1" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+  CUR2=$(kubectl get pod "$POD2" -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+  echo "    redis-0 revision = $CUR0"
+  echo "    redis-1 revision = $CUR1"
+  echo "    redis-2 revision = $CUR2"
+  if [ "$CUR0" = "$OLD0" ] && [ "$CUR1" = "$OLD1" ] && [ "$CUR2" = "$NEW_UPDATE" ]; then
+    pass 'Partition=2 生效：只有 redis-2 更新'
+  else
+    fail 'Partition 灰度验证失败'
+  fi
+
+  # Always restore partition=0 so next deploy / manual ops behave normally.
+  info "恢复 StatefulSet partition=0（正常全量滚动模式）"
+  kubectl patch sts "$STS_NAME" -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":0}}}}' >/dev/null 2>&1 || true
 fi
 
 title '最终状态'

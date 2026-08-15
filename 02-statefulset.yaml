@@ -77,7 +77,9 @@ spec:
             - sh
             - -c
             - |
-              set -eu
+              set -uo pipefail
+
+              BOOTSTRAP_DONE_FILE="/data/.cluster-bootstrap-done"
 
               echo "============================================"
               echo "Redis Pod startup"
@@ -100,62 +102,129 @@ spec:
               echo "Redis PID=${REDIS_PID}"
               echo "Waiting for local Redis..."
 
-              until redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG; do
+              for _ in $(seq 1 60); do
+                if redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG; then
+                  break
+                fi
                 sleep 1
               done
+              if ! redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG; then
+                echo "ERROR: Local Redis failed to become ready in 60s"
+                exit 1
+              fi
 
               echo "Local Redis is ready."
 
+              # ============================================================
               # Only redis-0 performs cluster bootstrap.
+              # Robustness rules (fix CrashLoopBackOff):
+              #   1. If BOOTSTRAP_DONE marker exists on PVC, trust nodes.conf
+              #      and skip bootstrap (avoids re-creating on pod restart).
+              #   2. If nodes.conf already knows >=3 nodes but state isn't ok,
+              #      wait up to 30s for Gossip convergence instead of
+              #      immediately calling --cluster create (which would fail).
+              #   3. --cluster create never kills the script (set -e removed);
+              #      if it fails we retry a few times and then still keep
+              #      redis-server running so logs are observable.
+              # ============================================================
               if [ "${POD_NAME}" = "redis-0" ]; then
-                echo "Checking existing Redis Cluster..."
 
-                CLUSTER_STATE=$(redis-cli -h 127.0.0.1 -p 6379 cluster info 2>/dev/null \
-                  | awk -F: '/^cluster_state:/ {print $2}' | tr -d '\r' || true)
-                CLUSTER_NODES_COUNT=$(redis-cli -h 127.0.0.1 -p 6379 cluster info 2>/dev/null \
-                  | awk -F: '/^cluster_known_nodes:/ {print $2}' | tr -d '\r' || true)
-                CLUSTER_SLOTS=$(redis-cli -h 127.0.0.1 -p 6379 cluster info 2>/dev/null \
-                  | awk -F: '/^cluster_slots_assigned:/ {print $2}' | tr -d '\r' || true)
-
-                echo "cluster_state=${CLUSTER_STATE}"
-                echo "cluster_known_nodes=${CLUSTER_NODES_COUNT}"
-                echo "cluster_slots_assigned=${CLUSTER_SLOTS}"
-
-                if [ "${CLUSTER_STATE}" = "ok" ] && \
-                   [ "${CLUSTER_NODES_COUNT}" = "3" ] && \
-                   [ "${CLUSTER_SLOTS}" = "16384" ]; then
-                  echo "Redis Cluster already initialized; skipping bootstrap."
+                if [ -f "${BOOTSTRAP_DONE_FILE}" ]; then
+                  echo "Found ${BOOTSTRAP_DONE_FILE}; cluster was already bootstrapped. Skipping init."
                 else
-                  echo "Redis Cluster not initialized; waiting for redis-1 and redis-2..."
 
-                  until redis-cli \
-                    -h redis-1.redis-svc.default.svc.cluster.local \
-                    -p 6379 ping 2>/dev/null | grep -q PONG; do
-                    echo "Waiting for redis-1..."
-                    sleep 2
-                  done
+                  echo "Checking existing Redis Cluster..."
 
-                  until redis-cli \
-                    -h redis-2.redis-svc.default.svc.cluster.local \
-                    -p 6379 ping 2>/dev/null | grep -q PONG; do
-                    echo "Waiting for redis-2..."
-                    sleep 2
-                  done
+                  get_cluster_info() {
+                    CI=$(redis-cli -h 127.0.0.1 -p 6379 cluster info 2>/dev/null || true)
+                    CLUSTER_STATE=$(echo "$CI" | awk -F: '/^cluster_state:/ {print $2}' | tr -d '\r' | xargs || true)
+                    CLUSTER_NODES_COUNT=$(echo "$CI" | awk -F: '/^cluster_known_nodes:/ {print $2}' | tr -d '\r' | xargs || true)
+                    CLUSTER_SLOTS=$(echo "$CI" | awk -F: '/^cluster_slots_assigned:/ {print $2}' | tr -d '\r' | xargs || true)
+                  }
+                  get_cluster_info
 
-                  echo "Creating Redis Cluster..."
+                  echo "cluster_state=${CLUSTER_STATE}"
+                  echo "cluster_known_nodes=${CLUSTER_NODES_COUNT}"
+                  echo "cluster_slots_assigned=${CLUSTER_SLOTS}"
 
-                  redis-cli --cluster create \
-                    redis-0.redis-svc.default.svc.cluster.local:6379 \
-                    redis-1.redis-svc.default.svc.cluster.local:6379 \
-                    redis-2.redis-svc.default.svc.cluster.local:6379 \
-                    --cluster-replicas 0 \
-                    --cluster-yes
+                  ALREADY_OK=false
+                  if [ "${CLUSTER_STATE}" = "ok" ] && \
+                     [ "${CLUSTER_NODES_COUNT}" = "3" ] && \
+                     [ "${CLUSTER_SLOTS}" = "16384" ]; then
+                    ALREADY_OK=true
+                  fi
 
-                  echo "Cluster bootstrap finished."
-                  redis-cli -h 127.0.0.1 -p 6379 cluster info
+                  # If nodes.conf already has >=3 nodes but state is
+                  # converging, wait (this happens after a previous create
+                  # call that succeeded but pod restarted before state=ok).
+                  if [ "${ALREADY_OK}" = false ] && [ -n "${CLUSTER_NODES_COUNT}" ] && [ "${CLUSTER_NODES_COUNT}" -ge 3 ] 2>/dev/null; then
+                    echo "nodes.conf already has ${CLUSTER_NODES_COUNT} nodes; waiting up to 30s for cluster_state=ok convergence..."
+                    for _ in $(seq 1 15); do
+                      sleep 2
+                      get_cluster_info
+                      echo "  ... cluster_state=${CLUSTER_STATE} slots=${CLUSTER_SLOTS}"
+                      if [ "${CLUSTER_STATE}" = "ok" ] && [ "${CLUSTER_SLOTS}" = "16384" ]; then
+                        ALREADY_OK=true
+                        break
+                      fi
+                    done
+                  fi
+
+                  if [ "${ALREADY_OK}" = true ]; then
+                    echo "Redis Cluster already initialized (via PVC nodes.conf); skipping bootstrap."
+                  else
+                    echo "Redis Cluster not initialized; waiting for redis-1 and redis-2 to be reachable..."
+
+                    for _ in $(seq 1 120); do
+                      if redis-cli -h redis-1.redis-svc.default.svc.cluster.local -p 6379 ping 2>/dev/null | grep -q PONG && \
+                         redis-cli -h redis-2.redis-svc.default.svc.cluster.local -p 6379 ping 2>/dev/null | grep -q PONG; then
+                        break
+                      fi
+                      echo "Waiting for redis-1 / redis-2 PONG..."
+                      sleep 2
+                    done
+                    if ! redis-cli -h redis-1.redis-svc.default.svc.cluster.local -p 6379 ping 2>/dev/null | grep -q PONG; then
+                      echo "WARN: redis-1 never became reachable; proceeding anyway to attempt create"
+                    fi
+                    if ! redis-cli -h redis-2.redis-svc.default.svc.cluster.local -p 6379 ping 2>/dev/null | grep -q PONG; then
+                      echo "WARN: redis-2 never became reachable; proceeding anyway to attempt create"
+                    fi
+
+                    echo "Creating Redis Cluster (max 3 retries)..."
+                    CREATE_OK=false
+                    for attempt in 1 2 3; do
+                      echo "--- cluster create attempt ${attempt} ---"
+                      if redis-cli --cluster create \
+                        redis-0.redis-svc.default.svc.cluster.local:6379 \
+                        redis-1.redis-svc.default.svc.cluster.local:6379 \
+                        redis-2.redis-svc.default.svc.cluster.local:6379 \
+                        --cluster-replicas 0 \
+                        --cluster-yes; then
+                        CREATE_OK=true
+                        break
+                      fi
+                      echo "  attempt ${attempt} failed, sleeping 5s before retry..."
+                      sleep 5
+                    done
+
+                    if [ "${CREATE_OK}" = true ]; then
+                      echo "Cluster bootstrap create command succeeded."
+                      sleep 5
+                      get_cluster_info
+                      if [ "${CLUSTER_STATE}" = "ok" ]; then
+                        echo "Writing bootstrap done marker: ${BOOTSTRAP_DONE_FILE}"
+                        touch "${BOOTSTRAP_DONE_FILE}" || true
+                      fi
+                    else
+                      echo "ERROR: redis-cli --cluster create failed 3 times; keeping redis-server running for manual inspection (NOT crashing pod)."
+                    fi
+                    echo "Cluster info after bootstrap attempt:"
+                    redis-cli -h 127.0.0.1 -p 6379 cluster info 2>/dev/null || true
+                  fi
                 fi
               fi
 
+              echo "Startup complete; now waiting on redis-server pid=${REDIS_PID}"
               wait ${REDIS_PID}
 
           resources:

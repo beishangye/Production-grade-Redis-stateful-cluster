@@ -39,3 +39,10 @@ kubeconfig
 *.backup
 tmp/
 temp/
+
+# ============================================================
+# Local problem / debug logs
+# ============================================================
+problem.txt
+debug.txt
+*.log.txt
