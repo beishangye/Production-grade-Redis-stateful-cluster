@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: redis-verify
+  labels:
+    app: redis-verify
+spec:
+  restartPolicy: Never
+  containers:
+    - name: debug
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo "============================================"
+          echo "Redis Cluster DNS verification"
+          echo "============================================"
+
+          echo "=== redis-0 ==="
+          nslookup redis-0.redis-svc.default.svc.cluster.local
+
+          echo "=== redis-1 ==="
+          nslookup redis-1.redis-svc.default.svc.cluster.local
+
+          echo "=== redis-2 ==="
+          nslookup redis-2.redis-svc.default.svc.cluster.local
+
+          echo "Waiting..."
+          sleep 3600

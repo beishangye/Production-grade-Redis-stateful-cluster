@@ -1,0 +1,10 @@
+# Shell scripts: force LF line endings even on Windows
+*.sh text eol=lf
+
+# YAML / Markdown / text files: normalized line endings
+*.yaml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.conf text eol=lf
+*.template text eol=lf

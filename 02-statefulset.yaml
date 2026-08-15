@@ -1,0 +1,233 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  labels:
+    app: redis
+    tier: db
+spec:
+  serviceName: redis-svc
+  replicas: 3
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      app: redis
+      tier: db
+  template:
+    metadata:
+      labels:
+        app: redis
+        tier: db
+        version: v3
+    spec:
+      terminationGracePeriodSeconds: 30
+
+      tolerations:
+        - key: "gpu"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: disk
+                    operator: In
+                    values:
+                      - ssd
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - redis
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: redis
+          image: redis:7.2-alpine
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: redis
+              containerPort: 6379
+            - name: cluster-bus
+              containerPort: 16379
+
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+
+              echo "============================================"
+              echo "Redis Pod startup"
+              echo "============================================"
+              echo "POD_NAME=${POD_NAME}"
+              echo "POD_IP=${POD_IP}"
+
+              # ConfigMap is read-only; generate writable config on PVC.
+              sed "s/\${POD_IP}/${POD_IP}/g" \
+                /etc/redis-template/redis.conf.template \
+                > /data/redis.conf
+
+              echo "Generated Redis config:"
+              grep -E 'cluster-announce-ip|cluster-config-file|dir |appendfilename' \
+                /data/redis.conf || true
+
+              redis-server /data/redis.conf &
+              REDIS_PID=$!
+
+              echo "Redis PID=${REDIS_PID}"
+              echo "Waiting for local Redis..."
+
+              until redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG; do
+                sleep 1
+              done
+
+              echo "Local Redis is ready."
+
+              # Only redis-0 performs cluster bootstrap.
+              if [ "${POD_NAME}" = "redis-0" ]; then
+                echo "Checking existing Redis Cluster..."
+
+                CLUSTER_STATE=$(redis-cli -h 127.0.0.1 -p 6379 cluster info 2>/dev/null \
+                  | awk -F: '/^cluster_state:/ {print $2}' | tr -d '\r' || true)
+                CLUSTER_NODES_COUNT=$(redis-cli -h 127.0.0.1 -p 6379 cluster info 2>/dev/null \
+                  | awk -F: '/^cluster_known_nodes:/ {print $2}' | tr -d '\r' || true)
+                CLUSTER_SLOTS=$(redis-cli -h 127.0.0.1 -p 6379 cluster info 2>/dev/null \
+                  | awk -F: '/^cluster_slots_assigned:/ {print $2}' | tr -d '\r' || true)
+
+                echo "cluster_state=${CLUSTER_STATE}"
+                echo "cluster_known_nodes=${CLUSTER_NODES_COUNT}"
+                echo "cluster_slots_assigned=${CLUSTER_SLOTS}"
+
+                if [ "${CLUSTER_STATE}" = "ok" ] && \
+                   [ "${CLUSTER_NODES_COUNT}" = "3" ] && \
+                   [ "${CLUSTER_SLOTS}" = "16384" ]; then
+                  echo "Redis Cluster already initialized; skipping bootstrap."
+                else
+                  echo "Redis Cluster not initialized; waiting for redis-1 and redis-2..."
+
+                  until redis-cli \
+                    -h redis-1.redis-svc.default.svc.cluster.local \
+                    -p 6379 ping 2>/dev/null | grep -q PONG; do
+                    echo "Waiting for redis-1..."
+                    sleep 2
+                  done
+
+                  until redis-cli \
+                    -h redis-2.redis-svc.default.svc.cluster.local \
+                    -p 6379 ping 2>/dev/null | grep -q PONG; do
+                    echo "Waiting for redis-2..."
+                    sleep 2
+                  done
+
+                  echo "Creating Redis Cluster..."
+
+                  redis-cli --cluster create \
+                    redis-0.redis-svc.default.svc.cluster.local:6379 \
+                    redis-1.redis-svc.default.svc.cluster.local:6379 \
+                    redis-2.redis-svc.default.svc.cluster.local:6379 \
+                    --cluster-replicas 0 \
+                    --cluster-yes
+
+                  echo "Cluster bootstrap finished."
+                  redis-cli -h 127.0.0.1 -p 6379 cluster info
+                fi
+              fi
+
+              wait ${REDIS_PID}
+
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - |
+                  redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -q PONG
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - |
+                    echo "Redis graceful shutdown..."
+                    redis-cli -h 127.0.0.1 -p 6379 save 2>/dev/null || true
+                    sleep 5
+
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/redis-template
+              readOnly: true
+            - name: data
+              mountPath: /data
+
+      volumes:
+        - name: conf
+          configMap:
+            name: redis-conf
+            items:
+              - key: redis.conf
+                path: redis.conf.template
+            defaultMode: 0444
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: redis
+          tier: db
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi

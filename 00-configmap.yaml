@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-conf
+  labels:
+    app: redis
+    tier: db
+data:
+  redis.conf: |
+    # ============================================
+    # Redis 7.2 Cluster - Day13
+    # ============================================
+
+    port 6379
+    bind 0.0.0.0
+    protected-mode no
+
+    # Redis Cluster
+    cluster-enabled yes
+    cluster-config-file /data/nodes.conf
+    cluster-node-timeout 5000
+    cluster-announce-ip ${POD_IP}
+    cluster-announce-port 6379
+    cluster-announce-bus-port 16379
+
+    # Data directory
+    dir /data
+
+    # Persistence
+    appendonly yes
+    appendfsync everysec
+    appendfilename "appendonly.aof"
+
+    # Memory
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+
+    # Slow log
+    slowlog-log-slower-than 10000
+    slowlog-max-len 128
+
+    # Network
+    timeout 0
+    tcp-keepalive 300
+
+    # stdout for kubectl logs
+    logfile ""
+    loglevel notice
